@@ -1,0 +1,977 @@
+package main
+
+import (
+	"encoding/binary"
+	"fmt"
+	"image"
+	"image/color"
+	"image/png"
+	"math"
+	"os"
+	"path/filepath"
+)
+
+// Стандартные матрицы квантования
+var QuantMatrixY = [][]int{
+	{16, 11, 10, 16, 24, 40, 51, 61},
+	{12, 12, 14, 19, 26, 58, 60, 55},
+	{14, 13, 16, 24, 40, 57, 69, 56},
+	{14, 17, 22, 29, 51, 87, 80, 62},
+	{18, 22, 37, 56, 68, 109, 103, 77},
+	{24, 35, 55, 64, 81, 104, 113, 92},
+	{49, 64, 78, 87, 103, 121, 120, 101},
+	{72, 92, 95, 98, 112, 100, 103, 99},
+}
+
+var QuantMatrixCbCr = [][]int{
+	{17, 18, 24, 47, 99, 99, 99, 99},
+	{18, 21, 26, 66, 99, 99, 99, 99},
+	{24, 26, 56, 99, 99, 99, 99, 99},
+	{47, 66, 99, 99, 99, 99, 99, 99},
+	{99, 99, 99, 99, 99, 99, 99, 99},
+	{99, 99, 99, 99, 99, 99, 99, 99},
+	{99, 99, 99, 99, 99, 99, 99, 99},
+	{99, 99, 99, 99, 99, 99, 99, 99},
+}
+
+// ConvertImage загружает PNG и возвращает различные форматы
+func ConvertImage(fileName string) ([]image.Image, error) {
+	// Открываем файл изображения
+	file, err := os.Open(fileName)
+	if err != nil {
+		return nil, fmt.Errorf("не удалось открыть файл: %v", err)
+	}
+	defer file.Close()
+
+	// Декодируем PNG изображение
+	img, err := png.Decode(file)
+	if err != nil {
+		return nil, fmt.Errorf("не удалось декодировать PNG: %v", err)
+	}
+
+	bounds := img.Bounds()
+	width, height := bounds.Dx(), bounds.Dy()
+
+	// Создаем grayscale изображение
+	imgGS := image.NewGray(bounds)
+	for y := 0; y < height; y++ {
+		for x := 0; x < width; x++ {
+			r, g, b, _ := img.At(x, y).RGBA()
+			r8, g8, b8 := uint8(r>>8), uint8(g>>8), uint8(b>>8)
+			gray := uint8(0.299*float64(r8) + 0.587*float64(g8) + 0.114*float64(b8))
+			imgGS.SetGray(x, y, color.Gray{Y: gray})
+		}
+	}
+
+	// Создаем ЧБ изображение с дизерингом
+	imgBW := image.NewGray(bounds)
+	for y := 0; y < height; y++ {
+		for x := 0; x < width; x++ {
+			gray := imgGS.GrayAt(x, y).Y
+			if gray > 127 {
+				imgBW.SetGray(x, y, color.Gray{Y: 255})
+			} else {
+				imgBW.SetGray(x, y, color.Gray{Y: 0})
+			}
+		}
+	}
+
+	// Создаем ЧБ изображение без дизеринга
+	imgBWNoDither := image.NewGray(bounds)
+	for y := 0; y < height; y++ {
+		for x := 0; x < width; x++ {
+			gray := imgGS.GrayAt(x, y).Y
+			if gray > 127 {
+				imgBWNoDither.SetGray(x, y, color.Gray{Y: 255})
+			} else {
+				imgBWNoDither.SetGray(x, y, color.Gray{Y: 0})
+			}
+		}
+	}
+
+	return []image.Image{img, imgGS, imgBW, imgBWNoDither}, nil
+}
+
+// RGBToYCbCr конвертирует RGB в YCbCr
+func RGBToYCbCr(r, g, b uint8) (y, cb, cr uint8) {
+	yFloat := 0.299*float64(r) + 0.587*float64(g) + 0.114*float64(b)
+	cbFloat := -0.1687*float64(r) - 0.3313*float64(g) + 0.5*float64(b) + 128
+	crFloat := 0.5*float64(r) - 0.4187*float64(g) - 0.0813*float64(b) + 128
+
+	yVal := math.Max(0, math.Min(255, yFloat))
+	cbVal := math.Max(0, math.Min(255, cbFloat))
+	crVal := math.Max(0, math.Min(255, crFloat))
+
+	return uint8(yVal), uint8(cbVal), uint8(crVal)
+}
+
+// YCbCrImage представляет изображение в YCbCr формате
+type YCbCrImage struct {
+	Y, Cb, Cr     [][]uint8
+	Width, Height int
+}
+
+// ConvertToYCbCr преобразует RGB изображение в YCbCr
+func ConvertToYCbCr(img image.Image) *YCbCrImage {
+	bounds := img.Bounds()
+	width, height := bounds.Dx(), bounds.Dy()
+
+	y := make([][]uint8, height)
+	cb := make([][]uint8, height)
+	cr := make([][]uint8, height)
+
+	for i := range y {
+		y[i] = make([]uint8, width)
+		cb[i] = make([]uint8, width)
+		cr[i] = make([]uint8, width)
+	}
+
+	for i := 0; i < height; i++ {
+		for j := 0; j < width; j++ {
+			r, g, b, _ := img.At(j, i).RGBA()
+			r8, g8, b8 := uint8(r>>8), uint8(g>>8), uint8(b>>8)
+			y[i][j], cb[i][j], cr[i][j] = RGBToYCbCr(r8, g8, b8)
+		}
+	}
+
+	return &YCbCrImage{
+		Y:      y,
+		Cb:     cb,
+		Cr:     cr,
+		Width:  width,
+		Height: height,
+	}
+}
+
+// Downsample выполняет даунсэмплинг канала с фактором k
+func Downsample(channel [][]uint8, k int) [][]uint8 {
+	height := len(channel)
+	if height == 0 {
+		return nil
+	}
+	width := len(channel[0])
+
+	newHeight := (height + k - 1) / k
+	newWidth := (width + k - 1) / k
+
+	result := make([][]uint8, newHeight)
+	for i := range result {
+		result[i] = make([]uint8, newWidth)
+	}
+
+	for y := 0; y < newHeight; y++ {
+		for x := 0; x < newWidth; x++ {
+			var sum int
+			var count int
+
+			for iy := 0; iy < k; iy++ {
+				sy := y*k + iy
+				if sy >= height {
+					continue
+				}
+
+				for ix := 0; ix < k; ix++ {
+					sx := x*k + ix
+					if sx >= width {
+						continue
+					}
+
+					sum += int(channel[sy][sx])
+					count++
+				}
+			}
+
+			if count > 0 {
+				result[y][x] = uint8(sum / count)
+			}
+		}
+	}
+
+	return result
+}
+
+// GetBlocks разбивает канал на блоки 8x8
+func GetBlocks(channel [][]uint8) [][][]float64 {
+	height := len(channel)
+	if height == 0 {
+		return nil
+	}
+	width := len(channel[0])
+
+	paddedHeight := ((height + 7) / 8) * 8
+	paddedWidth := ((width + 7) / 8) * 8
+
+	padded := make([][]uint8, paddedHeight)
+	for i := range padded {
+		padded[i] = make([]uint8, paddedWidth)
+		if i < height {
+			copy(padded[i], channel[i])
+		}
+	}
+
+	blocksY := paddedHeight / 8
+	blocksX := paddedWidth / 8
+	blocks := make([][][]float64, blocksY*blocksX)
+
+	blockIndex := 0
+	for by := 0; by < blocksY; by++ {
+		for bx := 0; bx < blocksX; bx++ {
+			block := make([][]float64, 8)
+			for i := range block {
+				block[i] = make([]float64, 8)
+				for j := range block[i] {
+					block[i][j] = float64(padded[by*8+i][bx*8+j]) - 128.0
+				}
+			}
+			blocks[blockIndex] = block
+			blockIndex++
+		}
+	}
+
+	return blocks
+}
+
+// DCT2D выполняет двумерное дискретное косинусное преобразование
+func DCT2D(block [][]float64) [][]float64 {
+	result := make([][]float64, 8)
+	for i := range result {
+		result[i] = make([]float64, 8)
+	}
+
+	for u := 0; u < 8; u++ {
+		for v := 0; v < 8; v++ {
+			var sum float64
+			cu := 1.0
+			if u == 0 {
+				cu = 1.0 / math.Sqrt(2.0)
+			}
+			cv := 1.0
+			if v == 0 {
+				cv = 1.0 / math.Sqrt(2.0)
+			}
+			for x := 0; x < 8; x++ {
+				for y := 0; y < 8; y++ {
+					sum += block[x][y] *
+						math.Cos((float64(2*x+1)*float64(u)*math.Pi)/16.0) *
+						math.Cos((float64(2*y+1)*float64(v)*math.Pi)/16.0)
+				}
+			}
+			result[u][v] = 0.25 * cu * cv * sum
+		}
+	}
+	return result
+}
+
+// IDCT2D выполняет обратное DCT преобразование
+func IDCT2D(block [][]float64) [][]float64 {
+	result := make([][]float64, 8)
+	for i := range result {
+		result[i] = make([]float64, 8)
+	}
+
+	for x := 0; x < 8; x++ {
+		for y := 0; y < 8; y++ {
+			var sum float64
+			for u := 0; u < 8; u++ {
+				for v := 0; v < 8; v++ {
+					cu := 1.0
+					if u == 0 {
+						cu = 1.0 / math.Sqrt(2.0)
+					}
+					cv := 1.0
+					if v == 0 {
+						cv = 1.0 / math.Sqrt(2.0)
+					}
+					sum += cu * cv * block[u][v] *
+						math.Cos((float64(2*x+1)*float64(u)*math.Pi)/16.0) *
+						math.Cos((float64(2*y+1)*float64(v)*math.Pi)/16.0)
+				}
+			}
+			result[x][y] = 0.25 * sum
+		}
+	}
+	return result
+}
+
+// QuantCoeff рассчитывает матрицу квантования для заданного качества
+// Модификация функции QuantCoeff
+func QuantCoeff(quantMatrix [][]int, quality int) [][]float64 {
+	result := make([][]float64, 8)
+	var scale float64
+	if quality < 50 {
+		scale = 5000.0 / float64(quality)
+	} else {
+		scale = 200.0 - 2.0*float64(quality)
+	}
+
+	for i := range result {
+		result[i] = make([]float64, 8)
+		for j := range result[i] {
+			val := math.Round(float64(quantMatrix[i][j]) * scale / 100.0)
+
+			// Ограничение для первого элемента
+			if i == 0 && j == 0 {
+				if i == 0 && j == 0 {
+					val = math.Min(val, 10.0) // Для яркости
+				} else if i == 0 && j == 0 {
+					val = math.Min(val, 16.0) // Для цветности
+				}
+			}
+
+			result[i][j] = math.Max(1.0, val)
+		}
+	}
+	return result
+}
+
+// Quantize выполняет квантование блока DCT
+func Quantize(block [][]float64, quantMatrix [][]float64) [][]int {
+	result := make([][]int, 8)
+	for i := range result {
+		result[i] = make([]int, 8)
+		for j := range result[i] {
+			result[i][j] = int(math.Round(block[i][j] / quantMatrix[i][j]))
+		}
+	}
+	return result
+}
+
+// InverseQuantize выполняет обратное квантование
+func InverseQuantize(block [][]int, quantMatrix [][]float64) [][]float64 {
+	result := make([][]float64, 8)
+	for i := range result {
+		result[i] = make([]float64, 8)
+		for j := range result[i] {
+			result[i][j] = float64(block[i][j]) * quantMatrix[i][j]
+		}
+	}
+	return result
+}
+
+// ZigZagOrder возвращает порядок зигзаг-сканирования для блоков 8x8
+func ZigZagOrder() [][2]int {
+	return [][2]int{
+		{0, 0}, {0, 1}, {1, 0}, {2, 0}, {1, 1}, {0, 2}, {0, 3}, {1, 2},
+		{2, 1}, {3, 0}, {4, 0}, {3, 1}, {2, 2}, {1, 3}, {0, 4}, {0, 5},
+		{1, 4}, {2, 3}, {3, 2}, {4, 1}, {5, 0}, {6, 0}, {5, 1}, {4, 2},
+		{3, 3}, {2, 4}, {1, 5}, {0, 6}, {0, 7}, {1, 6}, {2, 5}, {3, 4},
+		{4, 3}, {5, 2}, {6, 1}, {7, 0}, {7, 1}, {6, 2}, {5, 3}, {4, 4},
+		{3, 5}, {2, 6}, {1, 7}, {2, 7}, {3, 6}, {4, 5}, {5, 4}, {6, 3},
+		{7, 2}, {7, 3}, {6, 4}, {5, 5}, {4, 6}, {3, 7}, {4, 7}, {5, 6},
+		{6, 5}, {7, 4}, {7, 5}, {6, 6}, {5, 7}, {6, 7}, {7, 6}, {7, 7},
+	}
+}
+
+// ZigZagScan выполняет зигзаг-сканирование блока
+func ZigZagScan(block [][]int) []int {
+	result := make([]int, 64)
+	order := ZigZagOrder()
+	for i, pos := range order {
+		result[i] = block[pos[0]][pos[1]]
+	}
+	return result
+}
+
+// InverseZigZagScan выполняет обратное зигзаг сканирование
+func InverseZigZagScan(coefficients []int) [][]int {
+	block := make([][]int, 8)
+	for i := range block {
+		block[i] = make([]int, 8)
+	}
+	order := ZigZagOrder()
+	for i, pos := range order {
+		if i < len(coefficients) {
+			block[pos[0]][pos[1]] = coefficients[i]
+		}
+	}
+	return block
+}
+
+// DifferentialEncode выполняет дифференциальное кодирование DC-коэффициентов
+func DifferentialEncode(dc []int) []int {
+	if len(dc) == 0 {
+		return []int{}
+	}
+	result := make([]int, len(dc))
+	result[0] = dc[0]
+	for i := 1; i < len(dc); i++ {
+		result[i] = dc[i] - dc[i-1]
+	}
+	return result
+}
+
+// DifferentialDecode выполняет дифференциальное декодирование DC-коэффициентов
+func DifferentialDecode(diff []int) []int {
+	if len(diff) == 0 {
+		return []int{}
+	}
+	result := make([]int, len(diff))
+	result[0] = diff[0]
+	for i := 1; i < len(diff); i++ {
+		result[i] = result[i-1] + diff[i]
+	}
+	return result
+}
+
+// RunLengthEncode выполняет RLE кодирование для AC-коэффициентов
+func RunLengthEncode(ac []int) [][]int {
+	if len(ac) == 0 {
+		return [][]int{}
+	}
+	result := make([][]int, 0)
+	zeroCount := 0
+	for i := 0; i < len(ac); i++ {
+		if ac[i] == 0 {
+			zeroCount++
+			if zeroCount == 16 { // ZRL
+				result = append(result, []int{15, 0})
+				zeroCount = 0
+			}
+		} else {
+			category := 0
+			absVal := int(math.Abs(float64(ac[i])))
+			for tmpVal := absVal; tmpVal > 0; tmpVal >>= 1 {
+				category++
+			}
+			result = append(result, []int{zeroCount, category}) // (RUNLENGTH, SIZE)
+			result = append(result, []int{ac[i]})               // Value
+			zeroCount = 0
+		}
+	}
+	if zeroCount > 0 { // EOB
+		result = append(result, []int{0, 0})
+	}
+	return result
+}
+
+// RunLengthDecode выполняет RLE декодирование для AC-коэффициентов
+func RunLengthDecode(rleData [][]int) []int {
+	acCoefficients := make([]int, 0, 63) // Pre-allocate for typical case
+	valueExpected := false
+	for _, pair := range rleData {
+		if valueExpected {
+			acCoefficients = append(acCoefficients, pair[0])
+			valueExpected = false
+		} else {
+			run := pair[0]
+			size := pair[1]
+			if run == 0 && size == 0 { // EOB
+				break
+			}
+			if run == 15 && size == 0 { // ZRL
+				for k := 0; k < 16; k++ {
+					acCoefficients = append(acCoefficients, 0)
+				}
+			} else {
+				for k := 0; k < run; k++ {
+					acCoefficients = append(acCoefficients, 0)
+				}
+				valueExpected = true // Next pair is the value
+			}
+		}
+	}
+	// Fill remaining AC coefficients with zeros if EOB was encountered early
+	for len(acCoefficients) < 63 {
+		acCoefficients = append(acCoefficients, 0)
+	}
+	return acCoefficients[:63] // Ensure only 63 AC coeffs
+}
+
+// JpegCompressor - основной компрессор JPEG
+type JpegCompressor struct {
+	Quality int
+}
+
+// NewJpegCompressor создает новый экземпляр компрессора
+func NewJpegCompressor(quality int) *JpegCompressor {
+	if quality < 1 {
+		quality = 1
+	} else if quality > 100 {
+		quality = 100
+	}
+	return &JpegCompressor{Quality: quality}
+}
+
+// Compress выполняет сжатие изображения
+func (jc *JpegCompressor) Compress(img image.Image, outputPath string) error {
+	ycbcrImg := ConvertToYCbCr(img)
+
+	cbDownsampled := Downsample(ycbcrImg.Cb, 2)
+	crDownsampled := Downsample(ycbcrImg.Cr, 2)
+
+	yBlocks := GetBlocks(ycbcrImg.Y)
+	cbBlocks := GetBlocks(cbDownsampled)
+	crBlocks := GetBlocks(crDownsampled)
+
+	yDctBlocks := make([][][]float64, len(yBlocks))
+	cbDctBlocks := make([][][]float64, len(cbBlocks))
+	crDctBlocks := make([][][]float64, len(crBlocks))
+
+	for i, block := range yBlocks {
+		yDctBlocks[i] = DCT2D(block)
+	}
+	for i, block := range cbBlocks {
+		cbDctBlocks[i] = DCT2D(block)
+	}
+	for i, block := range crBlocks {
+		crDctBlocks[i] = DCT2D(block)
+	}
+
+	yQuantMatrix := QuantCoeff(QuantMatrixY, jc.Quality)
+	cbcrQuantMatrix := QuantCoeff(QuantMatrixCbCr, jc.Quality)
+
+	yQuantBlocks := make([][][]int, len(yDctBlocks))
+	cbQuantBlocks := make([][][]int, len(cbDctBlocks))
+	crQuantBlocks := make([][][]int, len(crDctBlocks))
+
+	for i, block := range yDctBlocks {
+		yQuantBlocks[i] = Quantize(block, yQuantMatrix)
+	}
+	for i, block := range cbDctBlocks {
+		cbQuantBlocks[i] = Quantize(block, cbcrQuantMatrix)
+	}
+	for i, block := range crDctBlocks {
+		crQuantBlocks[i] = Quantize(block, cbcrQuantMatrix)
+	}
+
+	yDC := make([]int, len(yQuantBlocks))
+	cbDC := make([]int, len(cbQuantBlocks))
+	crDC := make([]int, len(crQuantBlocks))
+
+	for i, block := range yQuantBlocks {
+		yDC[i] = block[0][0]
+	}
+	for i, block := range cbQuantBlocks {
+		cbDC[i] = block[0][0]
+	}
+	for i, block := range crQuantBlocks {
+		crDC[i] = block[0][0]
+	}
+
+	yDcDiff := DifferentialEncode(yDC)
+	cbDcDiff := DifferentialEncode(cbDC)
+	crDcDiff := DifferentialEncode(crDC)
+
+	yZigzag := make([][]int, len(yQuantBlocks))
+	cbZigzag := make([][]int, len(cbQuantBlocks))
+	crZigzag := make([][]int, len(crQuantBlocks))
+
+	for i, block := range yQuantBlocks {
+		yZigzag[i] = ZigZagScan(block)
+	}
+	for i, block := range cbQuantBlocks {
+		cbZigzag[i] = ZigZagScan(block)
+	}
+	for i, block := range crQuantBlocks {
+		crZigzag[i] = ZigZagScan(block)
+	}
+
+	yAcRle := make([][][]int, len(yZigzag))
+	cbAcRle := make([][][]int, len(cbZigzag))
+	crAcRle := make([][][]int, len(crZigzag))
+
+	for i, block := range yZigzag {
+		yAcRle[i] = RunLengthEncode(block[1:])
+	}
+	for i, block := range cbZigzag {
+		cbAcRle[i] = RunLengthEncode(block[1:])
+	}
+	for i, block := range crZigzag {
+		crAcRle[i] = RunLengthEncode(block[1:])
+	}
+
+	file, err := os.Create(outputPath)
+	if err != nil {
+		return fmt.Errorf("не удалось создать файл: %v", err)
+	}
+	defer file.Close()
+
+	header := []byte{
+		byte(ycbcrImg.Width >> 8), byte(ycbcrImg.Width & 0xFF),
+		byte(ycbcrImg.Height >> 8), byte(ycbcrImg.Height & 0xFF),
+		byte(jc.Quality),
+	}
+	if _, err := file.Write(header); err != nil {
+		return fmt.Errorf("ошибка записи заголовка: %v", err)
+	}
+
+	binary.Write(file, binary.BigEndian, uint32(len(yZigzag)))
+	binary.Write(file, binary.BigEndian, uint32(len(cbZigzag)))
+	binary.Write(file, binary.BigEndian, uint32(len(crZigzag)))
+
+	for _, val := range yDcDiff {
+		binary.Write(file, binary.BigEndian, int16(val))
+	}
+	for _, val := range cbDcDiff {
+		binary.Write(file, binary.BigEndian, int16(val))
+	}
+	for _, val := range crDcDiff {
+		binary.Write(file, binary.BigEndian, int16(val))
+	}
+
+	for _, blockRle := range yAcRle {
+		binary.Write(file, binary.BigEndian, uint16(len(blockRle)))
+		for _, run := range blockRle {
+			binary.Write(file, binary.BigEndian, int8(run[0]))
+			if len(run) > 1 {
+				binary.Write(file, binary.BigEndian, int16(run[1]))
+			}
+		}
+	}
+	for _, blockRle := range cbAcRle {
+		binary.Write(file, binary.BigEndian, uint16(len(blockRle)))
+		for _, run := range blockRle {
+			binary.Write(file, binary.BigEndian, int8(run[0]))
+			if len(run) > 1 {
+				binary.Write(file, binary.BigEndian, int16(run[1]))
+			}
+		}
+	}
+	for _, blockRle := range crAcRle {
+		binary.Write(file, binary.BigEndian, uint16(len(blockRle)))
+		for _, run := range blockRle {
+			binary.Write(file, binary.BigEndian, int8(run[0]))
+			if len(run) > 1 {
+				binary.Write(file, binary.BigEndian, int16(run[1]))
+			}
+		}
+	}
+
+	return nil
+}
+
+// DecompressJpeg реализует обратный процесс сжатия
+func DecompressJpeg(inputPath string, outputPath string) error {
+	file, err := os.Open(inputPath)
+	if err != nil {
+		return fmt.Errorf("не удалось открыть файл: %v", err)
+	}
+	defer file.Close()
+
+	header := make([]byte, 5)
+	if _, err := file.Read(header); err != nil {
+		return fmt.Errorf("не удалось прочитать заголовок: %v", err)
+	}
+	width := int(header[0])<<8 | int(header[1])
+	height := int(header[2])<<8 | int(header[3])
+	quality := int(header[4])
+
+	var yBlockCount, cbBlockCount, crBlockCount uint32
+	if err := binary.Read(file, binary.BigEndian, &yBlockCount); err != nil {
+		return fmt.Errorf("не удалось прочитать кол-во Y блоков: %v", err)
+	}
+	if err := binary.Read(file, binary.BigEndian, &cbBlockCount); err != nil {
+		return fmt.Errorf("не удалось прочитать кол-во Cb блоков: %v", err)
+	}
+	if err := binary.Read(file, binary.BigEndian, &crBlockCount); err != nil {
+		return fmt.Errorf("не удалось прочитать кол-во Cr блоков: %v", err)
+	}
+
+	yDcDiff := make([]int16, yBlockCount)
+	cbDcDiff := make([]int16, cbBlockCount)
+	crDcDiff := make([]int16, crBlockCount)
+
+	for i := 0; i < int(yBlockCount); i++ {
+		if err := binary.Read(file, binary.BigEndian, &yDcDiff[i]); err != nil {
+			return fmt.Errorf("не удалось прочитать Y DC коэфф. %d: %v", i, err)
+		}
+	}
+	for i := 0; i < int(cbBlockCount); i++ {
+		if err := binary.Read(file, binary.BigEndian, &cbDcDiff[i]); err != nil {
+			return fmt.Errorf("не удалось прочитать Cb DC коэфф. %d: %v", i, err)
+		}
+	}
+	for i := 0; i < int(crBlockCount); i++ {
+		if err := binary.Read(file, binary.BigEndian, &crDcDiff[i]); err != nil {
+			return fmt.Errorf("не удалось прочитать Cr DC коэфф. %d: %v", i, err)
+		}
+	}
+
+	yDc := DifferentialDecode(toIntSlice(yDcDiff))
+	cbDc := DifferentialDecode(toIntSlice(cbDcDiff))
+	crDc := DifferentialDecode(toIntSlice(crDcDiff))
+
+	yAcRle := make([][][]int, yBlockCount)
+	cbAcRle := make([][][]int, cbBlockCount)
+	crAcRle := make([][][]int, crBlockCount)
+
+	if err := readACData(file, yAcRle); err != nil {
+		return fmt.Errorf("ошибка чтения Y AC RLE: %v", err)
+	}
+	if err := readACData(file, cbAcRle); err != nil {
+		return fmt.Errorf("ошибка чтения Cb AC RLE: %v", err)
+	}
+	if err := readACData(file, crAcRle); err != nil {
+		return fmt.Errorf("ошибка чтения Cr AC RLE: %v", err)
+	}
+
+	yQuantBlocks := reconstructBlocks(yDc, yAcRle)
+	cbQuantBlocks := reconstructBlocks(cbDc, cbAcRle)
+	crQuantBlocks := reconstructBlocks(crDc, crAcRle)
+
+	yQuantMatrix := QuantCoeff(QuantMatrixY, quality)
+	cbcrQuantMatrix := QuantCoeff(QuantMatrixCbCr, quality)
+
+	yDctBlocks := inverseQuantizeBlocks(yQuantBlocks, yQuantMatrix)
+	cbDctBlocks := inverseQuantizeBlocks(cbQuantBlocks, cbcrQuantMatrix)
+	crDctBlocks := inverseQuantizeBlocks(crQuantBlocks, cbcrQuantMatrix)
+
+	yIdctBlocks := idct2DBlocks(yDctBlocks)
+	cbIdctBlocks := idct2DBlocks(cbDctBlocks)
+	crIdctBlocks := idct2DBlocks(crDctBlocks)
+
+	yChannel := MergeBlocks(yIdctBlocks, width, height)
+	cbChannel := MergeBlocks(cbIdctBlocks, (width+1)/2, (height+1)/2) // Chroma channels are downsampled
+	crChannel := MergeBlocks(crIdctBlocks, (width+1)/2, (height+1)/2)
+
+	cbUpsampled := upsample(cbChannel, width, height)
+	crUpsampled := upsample(crChannel, width, height)
+
+	img := image.NewRGBA(image.Rect(0, 0, width, height))
+	for y := 0; y < height; y++ {
+		for x := 0; x < width; x++ {
+			r, g, b := YCbCrToRGB(yChannel[y][x], cbUpsampled[y][x], crUpsampled[y][x])
+			img.SetRGBA(x, y, color.RGBA{r, g, b, 255})
+		}
+	}
+
+	outFile, err := os.Create(outputPath)
+	if err != nil {
+		return fmt.Errorf("не удалось создать выходной файл PNG: %v", err)
+	}
+	defer outFile.Close()
+
+	if err := png.Encode(outFile, img); err != nil {
+		return fmt.Errorf("не удалось закодировать PNG: %v", err)
+	}
+
+	return nil
+}
+
+func toIntSlice(slice []int16) []int {
+	result := make([]int, len(slice))
+	for i, v := range slice {
+		result[i] = int(v)
+	}
+	return result
+}
+
+func readACData(file *os.File, acRleBlocks [][][]int) error {
+	for i := range acRleBlocks { // Для каждого блока изображения (Y, Cb, Cr)
+		var rleListLength uint16 // Количество RLE-элементов (каждый из которых был []int в кодировщике) для этого блока изображения
+		if err := binary.Read(file, binary.BigEndian, &rleListLength); err != nil {
+			return fmt.Errorf("чтение длины списка RLE для блока %d: %v", i, err)
+		}
+
+		reconstructedRleList := make([][]int, 0, rleListLength)
+		var valueExpected bool = false // true, если предыдущий элемент был (run, category) и не EOB/ZRL
+
+		for itemCounter := 0; itemCounter < int(rleListLength); itemCounter++ {
+			if valueExpected {
+				var acVal int8
+				if err := binary.Read(file, binary.BigEndian, &acVal); err != nil {
+					// Если мы ожидали значение и не можем его прочитать, это проблема
+					return fmt.Errorf("чтение значения AC для блока %d, RLE-элемент %d (ожидалось значение): %v", i, itemCounter, err)
+				}
+				reconstructedRleList = append(reconstructedRleList, []int{int(acVal)})
+				valueExpected = false
+			} else {
+				var runPart int8
+				if err := binary.Read(file, binary.BigEndian, &runPart); err != nil {
+					return fmt.Errorf("чтение run-части RLE для блока %d, RLE-элемент %d: %v", i, itemCounter, err)
+				}
+				var catPart int16
+				if err := binary.Read(file, binary.BigEndian, &catPart); err != nil {
+					// Если мы ожидали пару (run, cat) и не можем прочитать вторую часть, это проблема
+					return fmt.Errorf("чтение cat-части RLE для блока %d, RLE-элемент %d (run-часть была %d): %v", i, itemCounter, runPart, err)
+				}
+
+				reconstructedRleList = append(reconstructedRleList, []int{int(runPart), int(catPart)})
+
+				isEOB := (runPart == 0 && catPart == 0)
+				isZRL := (runPart == 15 && catPart == 0)
+
+				if !isEOB && !isZRL {
+					valueExpected = true // После пары (run, category), которая не является EOB/ZRL, ожидается AC-значение
+				} else {
+					valueExpected = false // EOB/ZRL не имеют следующего AC-значения в *этой* RLE-последовательности
+				}
+			}
+		}
+
+		if valueExpected {
+			return fmt.Errorf("ошибка логики RLE в блоке %d: после обработки %d элементов ожидалось значение AC, но список RLE закончился", i, rleListLength)
+		}
+		acRleBlocks[i] = reconstructedRleList
+	}
+	return nil
+}
+
+func reconstructBlocks(dc []int, acRle [][][]int) [][][]int {
+	blocks := make([][][]int, len(dc))
+	for i := range blocks {
+		acCoefficients := RunLengthDecode(acRle[i])
+		allCoefficients := make([]int, 0, 64)
+		allCoefficients = append(allCoefficients, dc[i])
+		allCoefficients = append(allCoefficients, acCoefficients...)
+		blocks[i] = InverseZigZagScan(allCoefficients)
+	}
+	return blocks
+}
+
+func inverseQuantizeBlocks(quantBlocks [][][]int, quantMatrix [][]float64) [][][]float64 {
+	dctBlocks := make([][][]float64, len(quantBlocks))
+	for i, block := range quantBlocks {
+		dctBlocks[i] = InverseQuantize(block, quantMatrix)
+	}
+	return dctBlocks
+}
+
+func idct2DBlocks(dctBlocks [][][]float64) [][][]float64 {
+	blocks := make([][][]float64, len(dctBlocks))
+	for i, block := range dctBlocks {
+		blocks[i] = IDCT2D(block)
+	}
+	return blocks
+}
+
+// MergeBlocks собирает блоки в канал
+func MergeBlocks(blocks [][][]float64, width, height int) [][]uint8 {
+	paddedWidth := ((width + 7) / 8) * 8
+
+	channel := make([][]uint8, height)
+	for i := range channel {
+		channel[i] = make([]uint8, width)
+	}
+
+	blockXCount := paddedWidth / 8
+	if blockXCount == 0 {
+		blockXCount = 1
+	} // Avoid division by zero for small images
+
+	for blockIndex, blockData := range blocks {
+		blockY := blockIndex / blockXCount
+		blockX := blockIndex % blockXCount
+
+		for i := 0; i < 8; i++ {
+			for j := 0; j < 8; j++ {
+				y := blockY*8 + i
+				x := blockX*8 + j
+				if y < height && x < width {
+					val := blockData[i][j] + 128.0
+					if val < 0 {
+						val = 0
+					} else if val > 255 {
+						val = 255
+					}
+					channel[y][x] = uint8(math.Round(val))
+				}
+			}
+		}
+	}
+	return channel
+}
+
+// YCbCrToRGB конвертирует YCbCr в RGB
+func YCbCrToRGB(y, cb, cr uint8) (r, g, b uint8) {
+	rFloat := float64(y) + 1.402*(float64(cr)-128.0)
+	gFloat := float64(y) - 0.34414*(float64(cb)-128.0) - 0.71414*(float64(cr)-128.0)
+	bFloat := float64(y) + 1.772*(float64(cb)-128.0)
+
+	r = uint8(math.Max(0, math.Min(255, math.Round(rFloat))))
+	g = uint8(math.Max(0, math.Min(255, math.Round(gFloat))))
+	b = uint8(math.Max(0, math.Min(255, math.Round(bFloat))))
+	return
+}
+
+// Upsample выполняет апсемплинг канала (ближайший сосед)
+// Билинейная интерполяция вместо ближайшего соседа
+func upsample(channel [][]uint8, targetWidth, targetHeight int) [][]uint8 {
+	srcHeight := len(channel)
+	if srcHeight == 0 {
+		return make([][]uint8, targetHeight)
+	}
+	srcWidth := len(channel[0])
+
+	upsampled := make([][]uint8, targetHeight)
+	for i := range upsampled {
+		upsampled[i] = make([]uint8, targetWidth)
+	}
+
+	for y := 0; y < targetHeight; y++ {
+		for x := 0; x < targetWidth; x++ {
+			srcY := float64(y) / 2.0
+			srcX := float64(x) / 2.0
+
+			y0 := int(math.Floor(srcY))
+			y1 := int(math.Min(float64(srcHeight-1), math.Ceil(srcY)))
+			x0 := int(math.Floor(srcX))
+			x1 := int(math.Min(float64(srcWidth-1), math.Ceil(srcX)))
+
+			// Билинейная интерполяция
+			if y0 == y1 && x0 == x1 {
+				upsampled[y][x] = channel[y0][x0]
+			} else if y0 == y1 {
+				dx := srcX - float64(x0)
+				upsampled[y][x] = uint8(float64(channel[y0][x0])*(1-dx) +
+					float64(channel[y0][x1])*dx)
+			} else if x0 == x1 {
+				dy := srcY - float64(y0)
+				upsampled[y][x] = uint8(float64(channel[y0][x0])*(1-dy) +
+					float64(channel[y1][x0])*dy)
+			} else {
+				dx := srcX - float64(x0)
+				dy := srcY - float64(y0)
+
+				top := float64(channel[y0][x0])*(1-dx) + float64(channel[y0][x1])*dx
+				bottom := float64(channel[y1][x0])*(1-dx) + float64(channel[y1][x1])*dx
+
+				upsampled[y][x] = uint8(top*(1-dy) + bottom*dy)
+			}
+		}
+	}
+	return upsampled
+}
+
+func main() {
+	inputFile := "/home/kudrix/GolandProjects/AlgosLab2Sem4v4/lenna.png"
+	compressedFile := "/home/kudrix/GolandProjects/AlgosLab2Sem4v4/lenna.bin"
+	decompressedFile := "/home/kudrix/GolandProjects/AlgosLab2Sem4v4/lenna_decompressed.png"
+	quality := 100
+
+	// Проверка формата входного файла
+	if filepath.Ext(inputFile) != ".png" {
+		fmt.Println("Ошибка: входной файл должен быть в формате PNG")
+		return
+	}
+
+	// Загружаем PNG изображение
+	file, err := os.Open(inputFile)
+	if err != nil {
+		fmt.Printf("Ошибка открытия файла: %v\n", err)
+		return
+	}
+	img, err := png.Decode(file)
+	file.Close()
+	if err != nil {
+		fmt.Printf("Ошибка декодирования PNG: %v\n", err)
+		return
+	}
+
+	// Создаем и используем компрессор
+	compressor := NewJpegCompressor(quality)
+	err = compressor.Compress(img, compressedFile)
+	if err != nil {
+		fmt.Printf("Ошибка при сжатии: %v\n", err)
+		return
+	}
+	fmt.Println("Изображение успешно сжато и сохранено в", compressedFile)
+
+	// Распаковываем сжатый файл обратно в PNG
+	err = DecompressJpeg(compressedFile, decompressedFile)
+	if err != nil {
+		fmt.Printf("Ошибка при декодировании: %v\n", err)
+		return
+	}
+	fmt.Println("Изображение успешно распаковано и сохранено в", decompressedFile)
+}
